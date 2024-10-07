@@ -6,6 +6,7 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
 #include "cublas_common.h"
+#include "rope.cuh"
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -193,8 +194,9 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 // kernel launchers
 
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
-                       floatX* inp,
-                       int B, int T, int C, int NH, cudaStream_t stream) {
+                       floatX* inp, int B, int T, int C, int NH, 
+                       float* rope_freqs, float rope_scale, 
+                       cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -213,6 +215,13 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
+
+    if (rope_freqs) {
+        assert(HS % x128::size == 0);
+        total_threads = B * NH * T * (HS / x128::size);
+        num_blocks = CEIL_DIV(total_threads, block_size);
+        apply_rope_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, rope_freqs, B, NH, T, HS, true, rope_scale);
+    }
 
     floatX* preatt = inp; // reuse inp as scratch buffer
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
@@ -239,7 +248,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
-                        int B, int T, int C, int NH, cudaStream_t stream) {
+                        int B, int T, int C, int NH,
+                        float* rope_freqs, float rope_scale, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size
@@ -269,6 +279,13 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
     matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+    
+    if (rope_freqs) {
+        assert(HS % x128::size == 0);
+        int total_threads = B * NH * T * (HS / x128::size);
+        num_blocks = CEIL_DIV(total_threads, block_size);
+        apply_rope_kernel<<<num_blocks, block_size, 0, stream>>>(dq, dk, rope_freqs, B, NH, T, HS, false, rope_scale);
+    }
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);

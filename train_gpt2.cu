@@ -69,6 +69,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: set_zero_configs, multi_gpu_cpu_float_sum, multi_gpu_barrier
 // defines: multi_gpu_get_shard_offset, multi_gpu_async_reduce_gradient
 #include "llmc/zero.cuh"
+// defines: RoPEContext, init_rope_context, init_rope_freqs
+#include "llmc/rope.cuh"
 
 // ----------------------------------------------------------------------------
 // global vars for I/O
@@ -319,6 +321,7 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    RoPEContext* rope_context; // Data for RoPE
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -348,6 +351,7 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->rope_context = NULL; // RoPE related context data
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -362,6 +366,13 @@ void gpt2_allocate_weights(GPT2 *model) {
     // create memory for model parameters on the device
     assert(model->params_memory == nullptr);
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+
+    // allocate memory for rope frequencies
+    if (model->rope_context) {
+        int HS = model->config.channels / model->config.num_heads;
+        assert(HS % 2 == 0); // HS must be even for RoPE
+        init_rope_freqs(&(model->rope_context), model->config.max_seq_len, HS, main_stream);
+    }
 }
 
 void gpt2_allocate_state(GPT2 *model, int B, int T) {
@@ -677,7 +688,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, model->rope_context == NULL, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
@@ -727,7 +738,14 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+
+        if (model->rope_context) {
+            attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, 
+                              model->rope_context->rope_freqs, model->rope_context->scaling, main_stream);
+        }
+        else {
+            attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, NULL, 0, main_stream);
+        }
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
@@ -915,7 +933,14 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
-        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
+
+        if (model->rope_context) {
+            attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, 
+            model->rope_context->rope_freqs, model->rope_context->scaling, main_stream);
+        }
+        else {
+            attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, NULL, 0, main_stream);
+        }
         #endif
         if(model->recompute >= 2) {
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
@@ -947,7 +972,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         }
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
-                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state),
+                     model->rope_context == NULL, main_stream);
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
@@ -959,7 +985,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         #endif
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
-        floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
+        floatX* const pointers[] = {grads.wte, model->rope_context ? NULL : grads.wpe, grads.lnfw, grads.lnfb};
         const size_t nelem[] = {Vp * C, T * C, C, C};
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
     }
@@ -1004,6 +1030,10 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
         // grads_memory only contains the averaged gradients at the local shards,
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            if (model->rope_context && i == 1) {
+                // skip the wpe tensor if we are using RoPE -> minor optimization, results would be correct without this as well
+                continue;
+            }
             ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
             ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
             ptrdiff_t offset = tensor.offset + shard.offset;
@@ -1060,6 +1090,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // AdamW update
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (model->rope_context && i == 1) {
+            // skip the wpe tensor if we are using RoPE
+            continue;
+        }
+
         // generate a unique seed for each tensor
         unsigned int seed = random_u32(&model->rng_state);
 
@@ -1411,6 +1446,8 @@ void error_usage() {
     fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
     fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
     fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
+    // rope settings
+    fprintf(stderr, "  -er <int>    enable RoPE: 0=disable(default) others=enable\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1456,6 +1493,11 @@ int main(int argc, char *argv[]) {
     char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
     char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
     char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
+    // rope related
+    bool use_rope = false;        // controll whether to use RoPE or not
+    float rope_scaling = 1.0f;    // RoPE scaling factor
+    float rope_base = 10000.0f;  // RoPE base frequency
+
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -1463,7 +1505,7 @@ int main(int argc, char *argv[]) {
         // read in the args
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
-        else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
+        else if (argv[i][1] == 'e' && argv[i][2] == '\0') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
@@ -1498,6 +1540,9 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'e' && argv[i][2] == 'r') { use_rope = (atoi(argv[i+1]) != 0); }
+        else if (argv[i][1] == 'e' && argv[i][2] == 's') { rope_scaling = atof(argv[i+1]); }
+        else if (argv[i][1] == 'e' && argv[i][2] == 'b') { rope_base = atof(argv[i+1]); }
         else { error_usage(); }
     }
 
@@ -1571,19 +1616,29 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
+    // architectural modifications
+    #ifdef ENABLE_CUDNN
+    use_rope = false;  // RoPE is not supported with cudnn atm
+    #endif
+
+    if (use_rope) {
+        init_rope_context(&(model.rope_context), rope_base, rope_scaling, main_stream);
+    }
+
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         // if we are using master weights, we'll init them later inside load_state()
         bool weight_init = !use_master_weights;
         gpt2_build_from_checkpoint(&model, filename_buffer, weight_init);
     } else if (ends_with_bin(load_filename)) {
-        // otherwise, if this is a .bin file, we assume it's a model, let's init from it
+        // otherwise, if this is a .bin file, we assume it's a model, let's init from it       
         gpt2_build_from_checkpoint(&model, load_filename);
     } else {
         // if it's not .bin, it could be a "special descriptor". This descriptor is used to
         // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
         gpt_build_from_descriptor(&model, load_filename);
     }
+    
 
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
@@ -1597,6 +1652,7 @@ int main(int argc, char *argv[]) {
     printf0("| channels C            | %-50d |\n", model.config.channels);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
+    
 
     // build DataLoaders for both train and val
     int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
@@ -1611,6 +1667,8 @@ int main(int argc, char *argv[]) {
         // the number of (outer loop) steps each process should take for us to reach one epoch
         train_num_batches = ntok / total_batch_size;
     }
+    
+
     // figure out the number of validation steps to run for
     int val_num_batches = val_max_steps; // passed in from command line
     if (val_num_batches == -1) {
@@ -1638,6 +1696,12 @@ int main(int argc, char *argv[]) {
     set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
     printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
     printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // print RoPE setting
+    printf0("| use_rope              | %-50d |\n", use_rope);
+    printf0("| rope_scaling          | %-50f |\n", rope_scaling);
+    printf0("| rope_theta            | %-50f |\n", rope_base);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // prints outside of pretty table to here and below
