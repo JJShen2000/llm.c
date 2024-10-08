@@ -1197,6 +1197,10 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->inputs);
     cudaFreeCheck(&model->targets);
     cudaFreeCheck(&model->accumulated_mean_loss);
+    if (model->rope_context) {
+        cudaFreeCheck(&model->rope_context->rope_freqs);
+        free(model->rope_context);
+    }
     cudaCheck(cudaFreeHost(model->cpu_losses));
     free(model->workload_indices);
     free(model->bucket_info);
@@ -1448,6 +1452,8 @@ void error_usage() {
     fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
     // rope settings
     fprintf(stderr, "  -er <int>    enable RoPE: 0=disable(default) others=enable\n");
+    fprintf(stderr, "  -es <float>  RoPE scaling factor (default = 1)\n");
+    fprintf(stderr, "  -eb <float>  RoPE base frequency (default = 10000)\n");
     exit(EXIT_FAILURE);
 }
 
