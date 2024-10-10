@@ -71,11 +71,11 @@ __global__ void apply_rope_kernel(floatX* q, floatX* k, float* rope_freqs,
         float direction = is_forward ? (float) 1: (float) -1;
 
         // See formula 34 in https://arxiv.org/pdf/2104.09864
-        rotated_query[2*k] = q1 * cos_theta - direction * q2 * sin_theta;
-        rotated_query[2*k + 1] = q2 * cos_theta - direction * q1 * sin_theta;
+        rotated_query[2*k] = (floatX)(q1 * cos_theta - direction * q2 * sin_theta);
+        rotated_query[2*k + 1] = (floatX)(q2 * cos_theta + direction * q1 * sin_theta);
 
-        rotated_key[2*k] = k1 * cos_theta - direction * k2 * sin_theta;
-        rotated_key[2*k + 1] = k2 * cos_theta - direction * k1 * sin_theta;
+        rotated_key[2*k] = (floatX)(k1 * cos_theta - direction * k2 * sin_theta);
+        rotated_key[2*k + 1] = (floatX)(k2 * cos_theta + direction * k1 * sin_theta);
     }
 
     store128cs(&q[tensor_idx], rotated_query);
